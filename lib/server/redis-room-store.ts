@@ -96,6 +96,14 @@ function roomKey(code: string): string {
   return `room:${code}`;
 }
 
+/**
+ * Upstash auto-deserializes JSON strings inside `eval` results, while other
+ * Redis clients return raw strings. Accept both shapes.
+ */
+function parseJsonValue<T>(value: unknown): T {
+  return (typeof value === "string" ? JSON.parse(value) : value) as T;
+}
+
 export class RedisRoomStore implements RoomStore {
   private readonly redis: Redis;
 
@@ -122,7 +130,8 @@ export class RedisRoomStore implements RoomStore {
     if (status === 0) return { status: "not_found" };
     if (status === 2) return { status: "already_claimed" };
 
-    const record = JSON.parse(result[1] ?? "") as RoomRecord;
+    if (result[1] == null) throw new Error("Missing room payload.");
+    const record = parseJsonValue<RoomRecord>(result[1]);
     return { status: "claimed", room: record };
   }
 
@@ -163,7 +172,8 @@ export class RedisRoomStore implements RoomStore {
     if (status === 2) return { status: "forbidden" };
     if (status === 3) return { status: "ok", answer: null };
 
-    const answer = JSON.parse(result[1] ?? "") as SdpPayload;
+    if (result[1] == null) throw new Error("Missing answer payload.");
+    const answer = parseJsonValue<SdpPayload>(result[1]);
     return { status: "ok", answer };
   }
 
