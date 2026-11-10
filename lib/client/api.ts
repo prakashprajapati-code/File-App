@@ -1,3 +1,6 @@
+import { createLogger } from "@/lib/log/logger";
+import type { LogRole } from "@/lib/log/types";
+
 export interface ApiSuccess<T> {
   ok: true;
   data: T;
@@ -20,6 +23,16 @@ export class ApiError extends Error {
   }
 }
 
+function detectRole(): LogRole {
+  if (typeof window === "undefined") return "unknown";
+  const path = window.location.pathname;
+  if (path.startsWith("/tv")) return "tv";
+  if (path.startsWith("/send")) return "phone";
+  return "unknown";
+}
+
+const log = createLogger("api", detectRole());
+
 async function readJson<T>(response: Response): Promise<ApiSuccess<T> | ApiFailure | null> {
   try {
     return (await response.json()) as ApiSuccess<T> | ApiFailure;
@@ -36,18 +49,51 @@ function throwIfFailed(response: Response, body: ApiSuccess<unknown> | ApiFailur
 }
 
 async function request<T>(input: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(input, {
-    ...init,
-    headers: {
-      ...(init?.body ? { "content-type": "application/json" } : {}),
-      ...init?.headers,
-    },
-  });
+  const method = init?.method ?? "GET";
+  const startedAt = Date.now();
 
-  if (response.status === 204) return undefined as T;
+  log.debug("request:start", { method, path: input });
+
+  let response: Response;
+  try {
+    response = await fetch(input, {
+      ...init,
+      headers: {
+        ...(init?.body ? { "content-type": "application/json" } : {}),
+        ...init?.headers,
+      },
+    });
+  } catch (error) {
+    log.error("request:network-error", {
+      method,
+      path: input,
+      ms: Date.now() - startedAt,
+      error,
+    });
+    throw error;
+  }
+
+  if (response.status === 204) {
+    log.info("request:empty", { method, path: input, status: 204, ms: Date.now() - startedAt });
+    return undefined as T;
+  }
 
   const body = await readJson<T>(response);
-  throwIfFailed(response, body);
+
+  try {
+    throwIfFailed(response, body);
+  } catch (error) {
+    log.error("request:failed", {
+      method,
+      path: input,
+      status: response.status,
+      code: error instanceof ApiError ? error.code : "UNKNOWN",
+      ms: Date.now() - startedAt,
+    });
+    throw error;
+  }
+
+  log.info("request:ok", { method, path: input, status: response.status, ms: Date.now() - startedAt });
   return (body as ApiSuccess<T>).data;
 }
 
@@ -80,14 +126,43 @@ export async function getAnswer(
   code: string,
   token: string,
 ): Promise<RTCSessionDescriptionInit | null> {
-  const response = await fetch(`/api/rooms/${encodeURIComponent(code)}/answer`, {
-    headers: { "x-token": token },
-  });
+  const path = `/api/rooms/${encodeURIComponent(code)}/answer`;
+  const startedAt = Date.now();
 
-  if (response.status === 204) return null;
+  let response: Response;
+  try {
+    response = await fetch(path, { headers: { "x-token": token } });
+  } catch (error) {
+    log.error("request:network-error", { method: "GET", path, ms: Date.now() - startedAt, error });
+    throw error;
+  }
+
+  if (response.status === 204) {
+    log.debug("request:empty", { method: "GET", path, status: 204, ms: Date.now() - startedAt });
+    return null;
+  }
 
   const body = await readJson<{ answer: RTCSessionDescriptionInit }>(response);
-  throwIfFailed(response, body);
+
+  try {
+    throwIfFailed(response, body);
+  } catch (error) {
+    log.error("request:failed", {
+      method: "GET",
+      path,
+      status: response.status,
+      code: error instanceof ApiError ? error.code : "UNKNOWN",
+      ms: Date.now() - startedAt,
+    });
+    throw error;
+  }
+
+  log.info("request:ok", {
+    method: "GET",
+    path,
+    status: response.status,
+    ms: Date.now() - startedAt,
+  });
   return (body as ApiSuccess<{ answer: RTCSessionDescriptionInit }>).data.answer;
 }
 

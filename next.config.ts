@@ -4,7 +4,7 @@ const nextConfig: NextConfig = {
   /* config options here */
   cacheComponents: true,
   partialPrefetching: true,
-  allowedDevOrigins:['extends-mine-hrs-ontario.trycloudflare.com'],
+  allowedDevOrigins:['broadcasting-assistant-crucial-john.trycloudflare.com'],
   turbopack: {
     rules: {
       "*.css": {

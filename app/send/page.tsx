@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { Suspense } from "react";
+import { LogPanel } from "@/components/LogPanel";
 import { StatusScreen } from "@/components/StatusScreen";
 import { SendPageContent } from "./send-page-content";
 
@@ -10,8 +11,11 @@ export const metadata: Metadata = {
 
 export default function SendPage() {
   return (
-    <Suspense fallback={<StatusScreen title="Loading..." />}>
-      <SendPageContent />
-    </Suspense>
+    <>
+      <Suspense fallback={<StatusScreen title="Loading..." />}>
+        <SendPageContent />
+      </Suspense>
+      <LogPanel role="phone" />
+    </>
   );
 }

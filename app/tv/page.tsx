@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { LogPanel } from "@/components/LogPanel";
 import { TvReceiver } from "./tv-receiver";
 
 export const metadata: Metadata = {
@@ -7,5 +8,10 @@ export const metadata: Metadata = {
 };
 
 export default function TvPage() {
-  return <TvReceiver />;
+  return (
+    <>
+      <TvReceiver />
+      <LogPanel role="tv" />
+    </>
+  );
 }

@@ -26,7 +26,7 @@ export function ConfirmCode({ code, onMatch, onMismatch, disabled = false }: Con
           <TvButton onClick={onMatch} disabled={disabled}>
             Matches
           </TvButton>
-          <TvButton onClick={onMismatch} variant="secondary">
+          <TvButton onClick={onMismatch} variant="secondary" disabled={disabled}>
             Does not match
           </TvButton>
         </div>
