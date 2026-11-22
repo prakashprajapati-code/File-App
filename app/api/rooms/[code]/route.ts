@@ -17,7 +17,8 @@ export async function GET(request: NextRequest, ctx: RouteParams) {
   }
 
   try {
-    const claim = await getRoomsService().claimRoom(parsedCode.data);
+    const claimToken = request.headers.get("x-claim-token") ?? undefined;
+    const claim = await getRoomsService().claimRoom(parsedCode.data, claimToken);
     return ok(claim);
   } catch (error) {
     return toErrorResponse(error);

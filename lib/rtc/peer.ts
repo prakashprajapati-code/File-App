@@ -1,7 +1,7 @@
 import type { ControlMessage } from "@/lib/transfer/protocol";
 import { isControlMessage } from "@/lib/transfer/protocol";
+import { getIceServers } from "./ice-config";
 
-export const ICE_GATHERING_TIMEOUT_MS = 5_000;
 export const CHANNEL_OPEN_TIMEOUT_MS = 20_000;
 
 export interface PeerChannels {
@@ -9,42 +9,21 @@ export interface PeerChannels {
   data: RTCDataChannel;
 }
 
-/** No STUN and no TURN: candidates must be local (same Wi-Fi / hotspot). */
-export function createPeerConnection(): RTCPeerConnection {
-  return new RTCPeerConnection({ iceServers: [] });
+/**
+ * Direct host candidates stay preferred. STUN is used only to obtain a
+ * reachable address when the network hides local addresses behind mDNS.
+ */
+export function createPeerConnection(iceServers: RTCIceServer[] = getIceServers()): RTCPeerConnection {
+  return new RTCPeerConnection({ iceServers });
 }
 
-export function waitForIceGathering(
-  pc: RTCPeerConnection,
-  timeoutMs = ICE_GATHERING_TIMEOUT_MS,
-): Promise<void> {
-  if (pc.iceGatheringState === "complete") return Promise.resolve();
-
-  return new Promise((resolve) => {
-    let settled = false;
-
-    const finish = () => {
-      if (settled) return;
-      settled = true;
-      pc.removeEventListener("icegatheringstatechange", handleStateChange);
-      clearTimeout(timer);
-      resolve();
-    };
-
-    const handleStateChange = () => {
-      if (pc.iceGatheringState === "complete") finish();
-    };
-
-    const timer = setTimeout(finish, timeoutMs);
-    pc.addEventListener("icegatheringstatechange", handleStateChange);
-    if (pc.iceGatheringState === "complete") finish();
-  });
-}
-
+/**
+ * SDP is sent immediately; candidates that arrive later go through the
+ * candidate mailbox. Waiting for gathering here dropped every late candidate.
+ */
 export async function createOffer(pc: RTCPeerConnection): Promise<RTCSessionDescriptionInit> {
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
-  await waitForIceGathering(pc);
   return pc.localDescription ?? offer;
 }
 
@@ -55,7 +34,6 @@ export async function createAnswer(
   await pc.setRemoteDescription(offer);
   const answer = await pc.createAnswer();
   await pc.setLocalDescription(answer);
-  await waitForIceGathering(pc);
   return pc.localDescription ?? answer;
 }
 

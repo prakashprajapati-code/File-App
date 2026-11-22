@@ -2,6 +2,7 @@ export type RoomErrorCode =
   | "NOT_FOUND"
   | "CLAIMED"
   | "CONFLICT"
+  | "ANSWER_EXISTS"
   | "FORBIDDEN"
   | "RATE_LIMITED"
   | "INVALID";
@@ -26,6 +27,7 @@ export function statusForRoomError(code: RoomErrorCode): number {
       return 404;
     case "CLAIMED":
     case "CONFLICT":
+    case "ANSWER_EXISTS":
       return 409;
     case "RATE_LIMITED":
       return 429;

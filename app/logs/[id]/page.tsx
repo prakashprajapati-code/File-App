@@ -1,8 +1,7 @@
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
+import { Suspense } from "react";
 import { readClientLog } from "@/lib/server/log-store";
-
-export const dynamic = "force-dynamic";
 
 export const metadata: Metadata = {
   title: "Client log",
@@ -18,7 +17,29 @@ const LEVEL_STYLES: Record<string, string> = {
   error: "text-red-400",
 };
 
-export default async function ClientLogPage({ params }: { params: Promise<{ id: string }> }) {
+const PAGE_CLASS = "min-h-dvh bg-zinc-950 px-4 py-8 text-zinc-200";
+
+/**
+ * The log id is a runtime param and Redis is read uncached, so the content must
+ * sit behind Suspense for Cache Components to produce an app shell.
+ */
+export default function ClientLogPage({ params }: { params: Promise<{ id: string }> }) {
+  return (
+    <Suspense
+      fallback={
+        <main className={PAGE_CLASS}>
+          <p className="text-sm text-zinc-400" role="status">
+            Loading log…
+          </p>
+        </main>
+      }
+    >
+      <ClientLogContent params={params} />
+    </Suspense>
+  );
+}
+
+async function ClientLogContent({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
   if (!LOG_ID_PATTERN.test(id)) notFound();
 
@@ -26,7 +47,7 @@ export default async function ClientLogPage({ params }: { params: Promise<{ id: 
   if (!payload) notFound();
 
   return (
-    <main className="min-h-dvh bg-zinc-950 px-4 py-8 text-zinc-200">
+    <main className={PAGE_CLASS}>
       <div className="mx-auto flex max-w-3xl flex-col gap-4">
         <header className="flex flex-col gap-1">
           <h1 className="text-2xl font-bold text-white">Client log</h1>

@@ -1,5 +1,10 @@
 import { createLogger } from "@/lib/log/logger";
 import type { LogRole } from "@/lib/log/types";
+import type {
+  GetCandidatesResult,
+  IceCandidatePayload,
+  PostCandidatesResult,
+} from "@/lib/rooms/contract";
 
 export interface ApiSuccess<T> {
   ok: true;
@@ -106,8 +111,11 @@ export function createRoom(offer: RTCSessionDescriptionInit): Promise<{ code: st
 
 export function claimRoom(
   code: string,
+  claimToken?: string,
 ): Promise<{ offer: RTCSessionDescriptionInit; claimToken: string }> {
-  return request(`/api/rooms/${encodeURIComponent(code)}`);
+  return request(`/api/rooms/${encodeURIComponent(code)}`, {
+    headers: claimToken ? { "x-claim-token": claimToken } : undefined,
+  });
 }
 
 export function postAnswer(
@@ -164,6 +172,68 @@ export async function getAnswer(
     ms: Date.now() - startedAt,
   });
   return (body as ApiSuccess<{ answer: RTCSessionDescriptionInit }>).data.answer;
+}
+
+export interface CandidateAuth {
+  token?: string;
+  claimToken?: string;
+}
+
+function candidateHeaders(auth: CandidateAuth): Record<string, string> {
+  const headers: Record<string, string> = {};
+  if (auth.token) headers["x-token"] = auth.token;
+  if (auth.claimToken) headers["x-claim-token"] = auth.claimToken;
+  return headers;
+}
+
+/** Batching is handled by the trickle controller; this is one idempotent POST. */
+export function postCandidates(
+  code: string,
+  auth: CandidateAuth,
+  candidates: IceCandidatePayload[],
+  complete: boolean,
+): Promise<PostCandidatesResult> {
+  return request(`/api/rooms/${encodeURIComponent(code)}/candidates`, {
+    method: "POST",
+    headers: candidateHeaders(auth),
+    body: JSON.stringify({ candidates, complete }),
+  });
+}
+
+/**
+ * Polls the other side's candidates. Kept separate from `request` so a 300 ms
+ * poll loop cannot flood the 400-entry log buffer with success entries.
+ */
+export async function getCandidates(
+  code: string,
+  auth: CandidateAuth,
+  since: number,
+): Promise<GetCandidatesResult> {
+  const path = `/api/rooms/${encodeURIComponent(code)}/candidates?since=${since}`;
+  const startedAt = Date.now();
+
+  let response: Response;
+  try {
+    response = await fetch(path, { headers: candidateHeaders(auth), cache: "no-store" });
+  } catch (error) {
+    log.debug("candidates:network-error", { ms: Date.now() - startedAt });
+    throw error;
+  }
+
+  const body = await readJson<GetCandidatesResult>(response);
+
+  try {
+    throwIfFailed(response, body);
+  } catch (error) {
+    log.debug("candidates:failed", {
+      status: response.status,
+      code: error instanceof ApiError ? error.code : "UNKNOWN",
+      ms: Date.now() - startedAt,
+    });
+    throw error;
+  }
+
+  return (body as ApiSuccess<GetCandidatesResult>).data;
 }
 
 export function deleteRoom(code: string, token: string): Promise<void> {

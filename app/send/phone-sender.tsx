@@ -5,12 +5,33 @@ import type { FormEvent } from "react";
 import { ConfirmCode } from "@/components/ConfirmCode";
 import { StatusScreen } from "@/components/StatusScreen";
 import { TvButton } from "@/components/TvButton";
-import { ApiError, claimRoom, postAnswer } from "@/lib/client/api";
+import {
+  ApiError,
+  claimRoom,
+  getCandidates,
+  postAnswer,
+  postCandidates,
+} from "@/lib/client/api";
+import {
+  clearClaimToken,
+  createClaimToken,
+  readClaimToken,
+  writeClaimToken,
+} from "@/lib/client/claim-token";
+import { withRetry } from "@/lib/client/retry";
 import { createLogger } from "@/lib/log/logger";
-import { explainConnectionFailure, snapshotPeer, trackPeerConnection } from "@/lib/log/webrtc";
+import { capturePeerDiagnostics } from "@/lib/log/diagnose";
+import type { DiagnosticError, DiagnosticPhase } from "@/lib/log/diagnose";
+import {
+  explainConnectionFailure,
+  trackDataChannel,
+  trackPeerConnection,
+} from "@/lib/log/webrtc";
+import type { PeerTracker } from "@/lib/log/webrtc";
 import { analyzeSdp, isValidIPv4, rewriteMdnsCandidates } from "@/lib/rtc/candidates";
 import type { CandidateReport } from "@/lib/rtc/candidates";
 import { getDeviceName } from "@/lib/rtc/device";
+import { getIceServers, summarizeIceServers } from "@/lib/rtc/ice-config";
 import {
   createAnswer,
   createPeerConnection,
@@ -19,6 +40,8 @@ import {
   waitForChannelOpen,
 } from "@/lib/rtc/peer";
 import { confirmationCode } from "@/lib/rtc/sdp";
+import { createIceTrickle } from "@/lib/rtc/trickle";
+import type { IceTrickle } from "@/lib/rtc/trickle";
 import { clearTvIp, readTvIp, writeTvIp } from "@/lib/rtc/tv-ip";
 import type { ControlMessage } from "@/lib/transfer/protocol";
 
@@ -41,14 +64,21 @@ export function PhoneSender({ initialCode }: PhoneSenderProps) {
   const [ipStatus, setIpStatus] = useState<string | null>(null);
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const controlRef = useRef<RTCDataChannel | null>(null);
+  const dataRef = useRef<RTCDataChannel | null>(null);
   const tvNameRef = useRef("TV");
   const mountedRef = useRef(true);
   const connectingRef = useRef(false);
   const attemptRef = useRef(0);
   const lastErrorRef = useRef<string | null>(null);
-  const stopTrackingRef = useRef<(() => void) | null>(null);
+  const trackerRef = useRef<PeerTracker | null>(null);
+  const trickleRef = useRef<IceTrickle | null>(null);
+  const configuredTurnRef = useRef(0);
+  const stopChannelTrackingRef = useRef<Array<() => void>>([]);
   const offerReportRef = useRef<CandidateReport | null>(null);
   const answerReportRef = useRef<CandidateReport | null>(null);
+  const phaseRef = useRef<DiagnosticPhase>("remote-description");
+  const firstErrorRef = useRef<DiagnosticError | null>(null);
+  const startedAtRef = useRef(0);
   const log = useMemo(() => createLogger("phone", "phone"), []);
 
   useEffect(() => {
@@ -56,8 +86,13 @@ export function PhoneSender({ initialCode }: PhoneSenderProps) {
     return () => {
       mountedRef.current = false;
       attemptRef.current += 1;
-      stopTrackingRef.current?.();
-      stopTrackingRef.current = null;
+      phaseRef.current = "closed";
+      trickleRef.current?.stop();
+      trickleRef.current = null;
+      trackerRef.current?.stop();
+      trackerRef.current = null;
+      for (const stop of stopChannelTrackingRef.current) stop();
+      stopChannelTrackingRef.current = [];
       pcRef.current?.close();
       pcRef.current = null;
     };
@@ -68,13 +103,69 @@ export function PhoneSender({ initialCode }: PhoneSenderProps) {
   };
 
   const reset = () => {
-    stopTrackingRef.current?.();
-    stopTrackingRef.current = null;
+    phaseRef.current = "closed";
+    trickleRef.current?.stop();
+    trickleRef.current = null;
+    trackerRef.current?.stop();
+    trackerRef.current = null;
+    for (const stop of stopChannelTrackingRef.current) stop();
+    stopChannelTrackingRef.current = [];
     pcRef.current?.close();
     pcRef.current = null;
     controlRef.current = null;
+    dataRef.current = null;
     tvNameRef.current = "TV";
     connectingRef.current = false;
+  };
+
+  /**
+   * Captures ICE evidence before the peer is closed. Resetting first (the old
+   * order) produced an empty snapshot and hid the real failure.
+   */
+  const finalizeFailure = async (failure: { title: string; message: string; event: string }) => {
+    if (!firstErrorRef.current) {
+      firstErrorRef.current = {
+        event: failure.event,
+        detail: `${failure.title}: ${failure.message}`,
+      };
+    }
+
+    const pc = pcRef.current;
+    const tracker = trackerRef.current;
+    const ice = trickleRef.current?.counts() ?? null;
+
+    if (pc && tracker) {
+      const channels = [controlRef.current, dataRef.current].filter(
+        (channel): channel is RTCDataChannel => channel !== null,
+      );
+
+      try {
+        const { snapshot, report } = await capturePeerDiagnostics({
+          role: "phone",
+          phase: phaseRef.current,
+          pc,
+          channels,
+          local: tracker.counts(),
+          trickle: ice,
+          configuredTurn: configuredTurnRef.current,
+          signalingLost: ice?.signalingLost ?? false,
+          firstError: firstErrorRef.current,
+          elapsedMs: Date.now() - startedAtRef.current,
+        });
+
+        log.error("peer:snapshot", { peer: snapshot });
+        log.error("diagnostics:report", report);
+        if (report.case !== "OK") {
+          log.warn("diagnostics:case", { case: report.case, title: report.title });
+        }
+      } catch (error) {
+        log.warn("diagnostics:failed", {
+          error: error instanceof Error ? error.name : "unknown",
+        });
+      }
+    }
+
+    reset();
   };
 
   const handleControlMessage = (message: ControlMessage) => {
@@ -112,14 +203,38 @@ export function PhoneSender({ initialCode }: PhoneSenderProps) {
     attemptRef.current = attempt;
     connectingRef.current = true;
     lastErrorRef.current = null;
+    firstErrorRef.current = null;
+    phaseRef.current = "remote-description";
+    startedAtRef.current = Date.now();
     update({ phase: "connecting" });
     log.mark("attempt:start", { attempt, code });
+    const iceServers = summarizeIceServers(getIceServers());
+    configuredTurnRef.current = iceServers.turn;
+    log.info("session:env", {
+      userAgent: navigator.userAgent,
+      platform: navigator.platform,
+      language: navigator.language,
+      secureContext: window.isSecureContext,
+      hasPeerConnection: typeof RTCPeerConnection === "function",
+      origin: window.location.origin,
+      iceServers,
+    });
 
     const isCurrent = () => mountedRef.current && attemptRef.current === attempt;
 
     try {
-      const { offer, claimToken } = await claimRoom(code);
+      // A token created before the first claim makes a reload before the
+      // answer idempotent: the same phone reclaims its room instead of seeing
+      // CLAIMED. After the answer is posted the retry is rejected cleanly.
+      const storedClaimToken = readClaimToken(code);
+      const claimToken = storedClaimToken ?? createClaimToken();
+      writeClaimToken(code, claimToken);
+      log.info("claim:token", { reused: storedClaimToken !== null });
+
+      const claimed = await withRetry(() => claimRoom(code, claimToken));
       if (!isCurrent()) return;
+      const { offer } = claimed;
+      writeClaimToken(code, claimed.claimToken);
       log.mark("room:claimed", { code });
 
       const offerReport = analyzeSdp(offer.sdp ?? "");
@@ -140,8 +255,29 @@ export function PhoneSender({ initialCode }: PhoneSenderProps) {
 
       const pc = createPeerConnection();
       pcRef.current = pc;
-      stopTrackingRef.current = trackPeerConnection(pc, log.child("rtc"));
+      trackerRef.current = trackPeerConnection(pc, log.child("rtc"));
       log.mark("pc:created");
+
+      const trickle = createIceTrickle({
+        pc,
+        log: log.child("ice"),
+        transport: {
+          post: (candidates, complete) =>
+            postCandidates(code, { claimToken }, candidates, complete),
+          get: (since) => getCandidates(code, { claimToken }, since),
+        },
+      });
+      trickleRef.current = trickle;
+      // Capture before the answer exists and start polling now: the TV's
+      // candidates are kept in a queue until setRemoteDescription resolves.
+      trickle.capture();
+      trickle.pollRemote();
+
+      pc.addEventListener("iceconnectionstatechange", () => {
+        if (pc.iceConnectionState === "checking" && phaseRef.current === "remote-description") {
+          phaseRef.current = "checking";
+        }
+      });
 
       pc.addEventListener("connectionstatechange", () => {
         if (!isCurrent() || pc.connectionState !== "failed") return;
@@ -153,9 +289,6 @@ export function PhoneSender({ initialCode }: PhoneSenderProps) {
         });
         lastErrorRef.current = explanation.message;
         log.error("state:error", { ...explanation, reason: "connectionstatechange" });
-        void snapshotPeer(pc, controlRef.current ? [controlRef.current] : [])
-          .then((snapshot) => log.error("peer:snapshot", { peer: snapshot }))
-          .catch(() => undefined);
 
         update({
           phase: "error",
@@ -163,7 +296,11 @@ export function PhoneSender({ initialCode }: PhoneSenderProps) {
           message: explanation.message,
           showIpFallback: true,
         });
-        reset();
+        void finalizeFailure({
+          title: explanation.title,
+          message: explanation.message,
+          event: "connectionstatechange:failed",
+        });
       });
 
       let control: RTCDataChannel | null = null;
@@ -179,6 +316,7 @@ export function PhoneSender({ initialCode }: PhoneSenderProps) {
           if (!isCurrent()) return;
           const channel = event.channel;
           log.info("channel:arrived", { label: channel.label });
+          stopChannelTrackingRef.current.push(trackDataChannel(channel, log.child("rtc")));
 
           if (channel.label === "control") {
             control = channel;
@@ -191,6 +329,7 @@ export function PhoneSender({ initialCode }: PhoneSenderProps) {
           if (channel.label === "data") {
             channel.binaryType = "arraybuffer";
             data = channel;
+            dataRef.current = channel;
           }
           if (control && data) {
             clearTimeout(timer);
@@ -201,6 +340,7 @@ export function PhoneSender({ initialCode }: PhoneSenderProps) {
 
       const answer = await createAnswer(pc, remoteOffer);
       if (!isCurrent()) return;
+      phaseRef.current = "checking";
 
       const answerReport = analyzeSdp(answer.sdp ?? "");
       answerReportRef.current = answerReport;
@@ -209,13 +349,20 @@ export function PhoneSender({ initialCode }: PhoneSenderProps) {
         log.warn("answer:no-usable-candidate", { candidates: answerReport });
       }
 
-      await postAnswer(code, answer, claimToken);
+      // The offer is now the remote description, so queued TV candidates are
+      // safe to add. Local candidates start flowing right after.
+      await trickle.applyRemote();
+      trickle.start();
+      log.info("trickle:counts", { counts: trickle.counts() });
+
+      await withRetry(() => postAnswer(code, answer, claimToken));
       if (!isCurrent()) return;
       log.mark("answer:posted");
 
       const confirmation = await confirmationCode(offer.sdp ?? "", answer.sdp ?? "");
       if (!isCurrent()) return;
       log.info("confirm:code", { confirmation });
+      phaseRef.current = "channel-wait";
       update({ phase: "confirming", confirmation, channelReady: false, tvReady: false });
       log.mark("state:confirming");
 
@@ -227,6 +374,8 @@ export function PhoneSender({ initialCode }: PhoneSenderProps) {
       await Promise.all([waitForChannelOpen(control), waitForChannelOpen(data)]);
       if (!isCurrent()) return;
       log.info("channels:open");
+      // ICE is done: both channels are open, so stop posting/polling.
+      trickle.stop();
 
       sendControl(control, { t: "HELLO", role: "phone", name: getDeviceName() });
       log.info("control:hello-sent", { name: getDeviceName() });
@@ -237,24 +386,43 @@ export function PhoneSender({ initialCode }: PhoneSenderProps) {
     } catch (error) {
       if (!isCurrent()) return;
 
-      const isApiError = error instanceof ApiError;
-      const explanation = isApiError
-        ? null
-        : failureFromError(error, answerReportRef.current, offerReportRef.current);
-      const message =
-        lastErrorRef.current ??
-        (isApiError ? error.message : (explanation?.message ?? "Could not connect."));
+      // A concrete ICE failure already reported itself. Do not let a later
+      // channel timeout overwrite it, and do not capture the peer twice.
+      if (lastErrorRef.current) return;
+
+      if (error instanceof ApiError) {
+        const api = describeApiError(error);
+        if (api.clearClaimToken) clearClaimToken(code);
+
+        lastErrorRef.current = api.message;
+        log.error("state:error", {
+          title: api.title,
+          message: api.message,
+          code: error.code,
+        });
+
+        update({ phase: "error", title: api.title, message: api.message });
+        await finalizeFailure({
+          title: api.title,
+          message: api.message,
+          event: "connect:api-error",
+        });
+        return;
+      }
+
+      const explanation = failureFromError(
+        error,
+        answerReportRef.current,
+        offerReportRef.current,
+      );
+      const message = explanation?.message ?? "Could not connect.";
       const title = explanation?.title ?? "Could not connect";
 
-      log.error("state:error", {
-        title,
-        message,
-        code: isApiError ? error.code : null,
-        error,
-      });
+      lastErrorRef.current = message;
+      log.error("state:error", { title, message, error });
 
-      reset();
-      update({ phase: "error", title, message, showIpFallback: !isApiError });
+      update({ phase: "error", title, message, showIpFallback: true });
+      await finalizeFailure({ title, message, event: "connect:error" });
     } finally {
       if (attemptRef.current === attempt) connectingRef.current = false;
     }
@@ -269,6 +437,7 @@ export function PhoneSender({ initialCode }: PhoneSenderProps) {
     log.mark("user:confirm");
     sendControl(control, { t: "CONFIRM" });
     log.info("control:confirm-sent");
+    phaseRef.current = "connected";
     update({ phase: "connected", deviceName: tvNameRef.current });
   };
 
@@ -281,7 +450,7 @@ export function PhoneSender({ initialCode }: PhoneSenderProps) {
 
     // Invalidate the in-flight attempt so a late timeout cannot overwrite this state.
     attemptRef.current += 1;
-    connectingRef.current = false;
+    reset();
     update({
       phase: "error",
       title: "Codes did not match",
@@ -440,4 +609,50 @@ function failureFromError(
   }
 
   return { title: "Could not connect", message: raw };
+}
+
+/** Room errors are not network failures; each has a specific recovery step. */
+function describeApiError(error: ApiError): {
+  title: string;
+  message: string;
+  clearClaimToken: boolean;
+} {
+  switch (error.code) {
+    case "ANSWER_EXISTS":
+      return {
+        title: "Code already used",
+        message: "This code was already used. Show a new code on the TV and scan it again.",
+        clearClaimToken: true,
+      };
+    case "CLAIMED":
+      return {
+        title: "Code already used",
+        message: "This code has already been claimed. Show a new code on the TV.",
+        clearClaimToken: true,
+      };
+    case "NOT_FOUND":
+      return {
+        title: "Code expired",
+        message: "This code is no longer valid. Show a new code on the TV.",
+        clearClaimToken: true,
+      };
+    case "RATE_LIMITED":
+      return {
+        title: "Too many attempts",
+        message: "Wait a moment, then enter the code again.",
+        clearClaimToken: false,
+      };
+    case "INVALID":
+      return {
+        title: "Could not connect",
+        message: error.message,
+        clearClaimToken: true,
+      };
+    default:
+      return {
+        title: "Could not connect",
+        message: error.message,
+        clearClaimToken: false,
+      };
+  }
 }

@@ -1,12 +1,20 @@
 import "server-only";
 import { z } from "zod";
+import type {
+  GetCandidatesResult,
+  IceCandidatePayload,
+  IceSide,
+  PostCandidatesResult,
+} from "@/lib/rooms/contract";
+import { MAX_ICE_CANDIDATES_PER_POST, ROOM_TTL_SECONDS } from "@/lib/rooms/config";
 import { randomCode, randomToken, sha256Hex } from "./crypto";
 import { RoomError } from "./errors";
 import { getRedis } from "./redis";
 import { RedisRoomStore } from "./redis-room-store";
 import type { RoomStore } from "./room-store";
 
-export const ROOM_TTL_SECONDS = 120;
+export { ROOM_TTL_SECONDS };
+
 const CODE_ATTEMPTS = 10;
 
 export const codeSchema = z.string().regex(/^\d{4}$/, "Code must be 4 digits");
@@ -21,6 +29,51 @@ export const answerSchema = sdpSchema.extend({ type: z.literal("answer") });
 
 export type SdpPayload = z.infer<typeof sdpSchema>;
 
+export type { GetCandidatesResult, IceCandidatePayload, IceSide, PostCandidatesResult };
+
+/**
+ * A single trickled ICE candidate. `sdpMid` and `sdpMLineIndex` are both kept:
+ * browsers accept either one, and some Android builds only set the media index.
+ */
+export interface IceAuth {
+  role: IceSide;
+  token: string;
+}
+
+export const iceCandidateSchema = z.object({
+  candidate: z.string().min(1).max(1_024),
+  sdpMid: z.string().max(64).nullish(),
+  sdpMLineIndex: z.number().int().min(0).max(64).nullish(),
+  usernameFragment: z.string().max(256).nullish(),
+});
+
+export const candidatesBodySchema = z.object({
+  candidates: z.array(iceCandidateSchema).max(MAX_ICE_CANDIDATES_PER_POST),
+  complete: z.boolean().optional(),
+});
+
+export type CandidatesBody = z.infer<typeof candidatesBodySchema>;
+
+export function normalizeIceCandidate(candidate: z.infer<typeof iceCandidateSchema>): IceCandidatePayload {
+  return {
+    candidate: candidate.candidate,
+    sdpMid: candidate.sdpMid ?? null,
+    sdpMLineIndex: candidate.sdpMLineIndex ?? null,
+    usernameFragment: candidate.usernameFragment ?? null,
+  };
+}
+
+export interface RoomIce {
+  tv: IceCandidatePayload[];
+  phone: IceCandidatePayload[];
+  tvComplete: boolean;
+  phoneComplete: boolean;
+}
+
+export function emptyRoomIce(): RoomIce {
+  return { tv: [], phone: [], tvComplete: false, phoneComplete: false };
+}
+
 /**
  * The mailbox record. `tokenHash` belongs to the TV; `claimTokenHash` is set
  * when a phone claims the room. Neither hash is ever returned to a client.
@@ -31,6 +84,7 @@ export interface RoomRecord {
   claimed: boolean;
   tokenHash: string;
   claimTokenHash: string | null;
+  ice: RoomIce;
 }
 
 export interface RoomsServiceOptions {
@@ -64,6 +118,7 @@ export class RoomsService {
       claimed: false,
       tokenHash,
       claimTokenHash: null,
+      ice: emptyRoomIce(),
     };
 
     for (let attempt = 0; attempt < CODE_ATTEMPTS; attempt += 1) {
@@ -76,9 +131,14 @@ export class RoomsService {
     throw new RoomError("CONFLICT", "Could not allocate a room code. Try again.");
   }
 
-  async claimRoom(code: string): Promise<{ offer: SdpPayload; claimToken: string }> {
-    const claimToken = this.claimTokenGenerator();
-    const claimTokenHash = await sha256Hex(claimToken);
+  /**
+   * Claims a room. Passing the token the phone already holds makes claim retries
+   * and page reloads idempotent: the same phone gets its room back, a different
+   * phone still sees CLAIMED.
+   */
+  async claimRoom(code: string, claimToken?: string): Promise<{ offer: SdpPayload; claimToken: string }> {
+    const token = claimToken ?? this.claimTokenGenerator();
+    const claimTokenHash = await sha256Hex(token);
     const outcome = await this.store.claim(code, claimTokenHash);
 
     switch (outcome.status) {
@@ -87,7 +147,7 @@ export class RoomsService {
       case "already_claimed":
         throw new RoomError("CLAIMED", "This code has already been claimed.");
       case "claimed":
-        return { offer: outcome.room.offer, claimToken };
+        return { offer: outcome.room.offer, claimToken: token };
     }
   }
 
@@ -103,7 +163,10 @@ export class RoomsService {
       case "forbidden":
         throw new RoomError("FORBIDDEN", "Invalid claim token.");
       case "already_answered":
-        throw new RoomError("CONFLICT", "Answer already submitted.");
+        throw new RoomError(
+          "ANSWER_EXISTS",
+          "This code was already used. Show a new code on the TV.",
+        );
       case "ok":
         return;
     }
@@ -120,6 +183,56 @@ export class RoomsService {
         throw new RoomError("FORBIDDEN", "Invalid token.");
       case "ok":
         return outcome.answer;
+    }
+  }
+
+  async postCandidates(
+    code: string,
+    auth: IceAuth,
+    candidates: IceCandidatePayload[],
+    complete: boolean,
+  ): Promise<PostCandidatesResult> {
+    const tokenHash = await sha256Hex(auth.token);
+    const outcome = await this.store.postCandidates(
+      code,
+      auth.role,
+      tokenHash,
+      candidates,
+      complete,
+    );
+
+    switch (outcome.status) {
+      case "not_found":
+        throw new RoomError("NOT_FOUND", "Room not found or expired.");
+      case "forbidden":
+        throw new RoomError("FORBIDDEN", "Invalid room token.");
+      case "ok":
+        return {
+          accepted: outcome.accepted,
+          duplicate: outcome.duplicate,
+          dropped: outcome.dropped,
+          total: outcome.total,
+          complete: outcome.complete,
+        };
+    }
+  }
+
+  async getCandidates(code: string, auth: IceAuth, since: number): Promise<GetCandidatesResult> {
+    const tokenHash = await sha256Hex(auth.token);
+    const outcome = await this.store.getCandidates(code, auth.role, tokenHash, since);
+
+    switch (outcome.status) {
+      case "not_found":
+        throw new RoomError("NOT_FOUND", "Room not found or expired.");
+      case "forbidden":
+        throw new RoomError("FORBIDDEN", "Invalid room token.");
+      case "ok":
+        return {
+          candidates: outcome.candidates,
+          next: outcome.next,
+          total: outcome.total,
+          complete: outcome.complete,
+        };
     }
   }
 

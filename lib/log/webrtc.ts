@@ -1,5 +1,5 @@
 import type { CandidateReport } from "@/lib/rtc/candidates";
-import { isMdnsAddress, parseCandidateLine } from "@/lib/rtc/candidates";
+import { isMdnsAddress, isValidIPv4, parseCandidateLine } from "@/lib/rtc/candidates";
 import type { Logger } from "./logger";
 import { maskAddress } from "./redact";
 
@@ -12,14 +12,40 @@ export interface CandidateSummary {
   networkType: string | null;
 }
 
-export interface SelectedPairSummary {
+export interface CandidateCounts {
+  total: number;
+  host: number;
+  srflx: number;
+  prflx: number;
+  relay: number;
+  mdns: number;
+  ipv4: number;
+  ipv6: number;
+  gatheringComplete: boolean;
+}
+
+export interface CandidatePairSummary {
   state: string;
   nominated: boolean;
+  requestsSent: number | null;
+  requestsReceived: number | null;
+  responsesSent: number | null;
+  responsesReceived: number | null;
   roundTripTimeMs: number | null;
+  totalRoundTripTimeMs: number | null;
   bytesSent: number | null;
   bytesReceived: number | null;
   local: CandidateSummary | null;
   remote: CandidateSummary | null;
+}
+
+export interface DataChannelSummary {
+  label: string | null;
+  state: string | null;
+  messagesSent: number | null;
+  messagesReceived: number | null;
+  bytesSent: number | null;
+  bytesReceived: number | null;
 }
 
 export interface PeerSnapshot {
@@ -32,8 +58,17 @@ export interface PeerSnapshot {
   remoteCandidateCount: number;
   localCandidates: CandidateSummary[];
   remoteCandidates: CandidateSummary[];
-  selectedPair: SelectedPairSummary | null;
+  selectedPair: CandidatePairSummary | null;
+  selectedCandidatePairId: string | null;
+  iceRole: string | null;
+  pairs: CandidatePairSummary[];
+  dataChannels: DataChannelSummary[];
   dtlsState: string | null;
+}
+
+export interface PeerTracker {
+  stop(): void;
+  counts(): CandidateCounts;
 }
 
 export interface FailureExplanation {
@@ -57,22 +92,76 @@ function secondsToMs(value: number | null): number | null {
   return value === null ? null : Math.round(value * 1000);
 }
 
+export function emptyCandidateCounts(): CandidateCounts {
+  return {
+    total: 0,
+    host: 0,
+    srflx: 0,
+    prflx: 0,
+    relay: 0,
+    mdns: 0,
+    ipv4: 0,
+    ipv6: 0,
+    gatheringComplete: false,
+  };
+}
+
+function addCandidateType(counts: CandidateCounts, type: string): void {
+  if (type === "host") counts.host += 1;
+  else if (type === "srflx") counts.srflx += 1;
+  else if (type === "prflx") counts.prflx += 1;
+  else if (type === "relay") counts.relay += 1;
+}
+
+/** Converts `getStats()` candidate summaries to the same shape as live events. */
+export function countCandidateSummaries(
+  candidates: readonly CandidateSummary[],
+  gatheringComplete = false,
+): CandidateCounts {
+  const counts = emptyCandidateCounts();
+  counts.gatheringComplete = gatheringComplete;
+
+  for (const candidate of candidates) {
+    counts.total += 1;
+    addCandidateType(counts, candidate.type);
+
+    if (candidate.mdns || isMdnsAddress(candidate.address)) {
+      counts.mdns += 1;
+      continue;
+    }
+
+    if (candidate.address.includes(":")) counts.ipv6 += 1;
+    else if (/^\d{1,3}\.\d{1,3}\./.test(candidate.address)) counts.ipv4 += 1;
+  }
+
+  return counts;
+}
+
 /**
- * Records every ICE / signalling state transition and candidate as it happens.
- * Returns a cleanup function for the effect.
+ * Records every ICE / signalling state transition, candidate and channel event
+ * as it happens. Returns a tracker whose counts feed the diagnostic report.
  */
-export function trackPeerConnection(pc: RTCPeerConnection, log: Logger): () => void {
+export function trackPeerConnection(pc: RTCPeerConnection, log: Logger): PeerTracker {
+  const counts = emptyCandidateCounts();
+
   const onIceCandidate = (event: RTCPeerConnectionIceEvent): void => {
     if (!event.candidate || !event.candidate.candidate) {
-      log.info("ice:candidate:end");
+      counts.gatheringComplete = true;
+      log.info("ice:candidate:end", { counts: { ...counts } });
       return;
     }
 
     const parsed = parseCandidateLine(event.candidate.candidate);
     if (!parsed) {
-      log.warn("ice:candidate:unparsed", { candidate: event.candidate.candidate });
+      log.warn("ice:candidate:unparsed", { length: event.candidate.candidate.length });
       return;
     }
+
+    counts.total += 1;
+    addCandidateType(counts, parsed.type);
+    if (isMdnsAddress(parsed.address)) counts.mdns += 1;
+    else if (isValidIPv4(parsed.address)) counts.ipv4 += 1;
+    else if (parsed.address.includes(":")) counts.ipv6 += 1;
 
     log.info("ice:candidate", {
       type: parsed.type,
@@ -81,6 +170,7 @@ export function trackPeerConnection(pc: RTCPeerConnection, log: Logger): () => v
       port: parsed.port,
       mdns: isMdnsAddress(parsed.address),
     });
+    log.debug("ice:candidates:summary", { counts: { ...counts } });
   };
 
   const onIceCandidateError = (event: RTCPeerConnectionIceErrorEvent): void => {
@@ -88,13 +178,17 @@ export function trackPeerConnection(pc: RTCPeerConnection, log: Logger): () => v
       code: event.errorCode,
       text: event.errorText,
       url: event.url,
-      address: event.address,
+      address: event.address ? maskAddress(event.address) : null,
       port: event.port,
     });
   };
 
   const onGatheringStateChange = (): void => {
-    log.info("ice:gathering-state", { state: pc.iceGatheringState });
+    if (pc.iceGatheringState === "complete") counts.gatheringComplete = true;
+    log.info("ice:gathering-state", {
+      state: pc.iceGatheringState,
+      counts: { ...counts },
+    });
   };
 
   const onIceConnectionStateChange = (): void => {
@@ -121,14 +215,51 @@ export function trackPeerConnection(pc: RTCPeerConnection, log: Logger): () => v
   pc.addEventListener("signalingstatechange", onSignalingStateChange);
   pc.addEventListener("negotiationneeded", onNegotiationNeeded);
 
+  return {
+    stop: () => {
+      pc.removeEventListener("icecandidate", onIceCandidate);
+      pc.removeEventListener("icecandidateerror", onIceCandidateError);
+      pc.removeEventListener("icegatheringstatechange", onGatheringStateChange);
+      pc.removeEventListener("iceconnectionstatechange", onIceConnectionStateChange);
+      pc.removeEventListener("connectionstatechange", onConnectionStateChange);
+      pc.removeEventListener("signalingstatechange", onSignalingStateChange);
+      pc.removeEventListener("negotiationneeded", onNegotiationNeeded);
+    },
+    counts: () => ({ ...counts }),
+  };
+}
+
+/** Records when each side's DataChannel opens, closes, errors or starts closing. */
+export function trackDataChannel(channel: RTCDataChannel, log: Logger): () => void {
+  const label = channel.label;
+
+  const onOpen = (): void => {
+    log.info("channel:open", { label, readyState: channel.readyState });
+  };
+  const onClosing = (): void => {
+    log.info("channel:closing", { label, readyState: channel.readyState });
+  };
+  const onClose = (): void => {
+    log.warn("channel:close", { label, readyState: channel.readyState });
+  };
+  const onError = (event: RTCErrorEvent): void => {
+    log.error("channel:error", {
+      label,
+      readyState: channel.readyState,
+      error: event.error?.message ?? null,
+    });
+  };
+
+  channel.addEventListener("open", onOpen);
+  channel.addEventListener("closing", onClosing);
+  channel.addEventListener("close", onClose);
+  channel.addEventListener("error", onError);
+
   return () => {
-    pc.removeEventListener("icecandidate", onIceCandidate);
-    pc.removeEventListener("icecandidateerror", onIceCandidateError);
-    pc.removeEventListener("icegatheringstatechange", onGatheringStateChange);
-    pc.removeEventListener("iceconnectionstatechange", onIceConnectionStateChange);
-    pc.removeEventListener("connectionstatechange", onConnectionStateChange);
-    pc.removeEventListener("signalingstatechange", onSignalingStateChange);
-    pc.removeEventListener("negotiationneeded", onNegotiationNeeded);
+    channel.removeEventListener("open", onOpen);
+    channel.removeEventListener("closing", onClosing);
+    channel.removeEventListener("close", onClose);
+    channel.removeEventListener("error", onError);
   };
 }
 
@@ -146,23 +277,70 @@ function toCandidateSummary(stat: Record<string, unknown>): CandidateSummary | n
   };
 }
 
-function toSelectedPair(
+function toCandidatePairSummary(
   stat: Record<string, unknown>,
   locals: Map<string, CandidateSummary>,
   remotes: Map<string, CandidateSummary>,
-): SelectedPairSummary {
+): CandidatePairSummary {
   const localId = readString(stat.localCandidateId);
   const remoteId = readString(stat.remoteCandidateId);
 
   return {
     state: readString(stat.state) ?? "unknown",
     nominated: readBoolean(stat.nominated) === true,
+    requestsSent: readNumber(stat.requestsSent),
+    requestsReceived: readNumber(stat.requestsReceived),
+    responsesSent: readNumber(stat.responsesSent),
+    responsesReceived: readNumber(stat.responsesReceived),
     roundTripTimeMs: secondsToMs(readNumber(stat.currentRoundTripTime)),
+    totalRoundTripTimeMs: secondsToMs(readNumber(stat.totalRoundTripTime)),
     bytesSent: readNumber(stat.bytesSent),
     bytesReceived: readNumber(stat.bytesReceived),
     local: localId ? (locals.get(localId) ?? null) : null,
     remote: remoteId ? (remotes.get(remoteId) ?? null) : null,
   };
+}
+
+function toDataChannelSummary(stat: Record<string, unknown>): DataChannelSummary {
+  return {
+    label: readString(stat.label),
+    state: readString(stat.state) ?? readString(stat.readyState),
+    messagesSent: readNumber(stat.messagesSent),
+    messagesReceived: readNumber(stat.messagesReceived),
+    bytesSent: readNumber(stat.bytesSent),
+    bytesReceived: readNumber(stat.bytesReceived),
+  };
+}
+
+function pairRank(pair: CandidatePairSummary): number {
+  if (pair.state === "succeeded") return 0;
+  if (pair.state === "in-progress") return 1;
+  if (pair.state === "failed") return 2;
+  return 3;
+}
+
+/** Resolves `getStats()` or null, so a stuck stats call cannot block shutdown. */
+function getStatsWithTimeout(
+  pc: RTCPeerConnection,
+  timeoutMs = 1_000,
+): Promise<RTCStatsReport | null> {
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const finish = (value: RTCStatsReport | null): void => {
+      if (settled) return;
+      settled = true;
+      if (timer !== null) clearTimeout(timer);
+      resolve(value);
+    };
+
+    timer = setTimeout(() => finish(null), timeoutMs);
+    pc.getStats().then(
+      (value) => finish(value),
+      () => finish(null),
+    );
+  });
 }
 
 /**
@@ -187,20 +365,23 @@ export async function snapshotPeer(
     localCandidates: [],
     remoteCandidates: [],
     selectedPair: null,
+    selectedCandidatePairId: null,
+    iceRole: null,
+    pairs: [],
+    dataChannels: [],
     dtlsState: null,
   };
 
-  let report: RTCStatsReport;
-  try {
-    report = await pc.getStats();
-  } catch {
-    return base;
-  }
+  const report = await getStatsWithTimeout(pc);
+  if (!report) return base;
 
   const locals = new Map<string, CandidateSummary>();
   const remotes = new Map<string, CandidateSummary>();
-  const pairs: Array<{ stat: Record<string, unknown>; nominated: boolean }> = [];
+  const pairStats: Array<Record<string, unknown>> = [];
+  const dataChannels: DataChannelSummary[] = [];
   let dtlsState: string | null = null;
+  let selectedCandidatePairId: string | null = null;
+  let iceRole: string | null = null;
 
   report.forEach((value) => {
     const stat = value as unknown as Record<string, unknown>;
@@ -217,15 +398,34 @@ export async function snapshotPeer(
 
     if (type === "transport") {
       dtlsState = readString(stat.dtlsState) ?? dtlsState;
+      selectedCandidatePairId = readString(stat.selectedCandidatePairId) ?? selectedCandidatePairId;
+      iceRole = readString(stat.iceRole) ?? iceRole;
       return;
     }
 
-    if (type === "candidate-pair" && readString(stat.state) === "succeeded") {
-      pairs.push({ stat, nominated: readBoolean(stat.nominated) === true });
+    if (type === "candidate-pair") {
+      pairStats.push(stat);
+      return;
+    }
+
+    if (type === "data-channel") {
+      dataChannels.push(toDataChannelSummary(stat));
     }
   });
 
-  const selected = pairs.find((pair) => pair.nominated) ?? pairs[0];
+  const pairs = pairStats.map((stat) => toCandidatePairSummary(stat, locals, remotes));
+  pairs.sort((a, b) => {
+    const rank = pairRank(a) - pairRank(b);
+    if (rank !== 0) return rank;
+    return Number(b.nominated) - Number(a.nominated);
+  });
+
+  const selectedStat = selectedCandidatePairId
+    ? pairStats.find((stat) => readString(stat.id) === selectedCandidatePairId)
+    : undefined;
+  const succeededStats = pairStats.filter((stat) => readString(stat.state) === "succeeded");
+  const nominatedStat = succeededStats.find((stat) => readBoolean(stat.nominated) === true);
+  const selectedPairStat = selectedStat ?? nominatedStat ?? succeededStats[0];
 
   return {
     ...base,
@@ -233,7 +433,13 @@ export async function snapshotPeer(
     remoteCandidateCount: remotes.size,
     localCandidates: [...locals.values()].slice(0, 10),
     remoteCandidates: [...remotes.values()].slice(0, 10),
-    selectedPair: selected ? toSelectedPair(selected.stat, locals, remotes) : null,
+    selectedPair: selectedPairStat
+      ? toCandidatePairSummary(selectedPairStat, locals, remotes)
+      : null,
+    selectedCandidatePairId,
+    iceRole,
+    pairs,
+    dataChannels,
     dtlsState,
   };
 }
@@ -241,6 +447,7 @@ export async function snapshotPeer(
 /**
  * Turns the candidate reports and peer snapshot into a sentence that names the
  * actual problem instead of "check that both devices are on the same Wi-Fi".
+ * Kept for the existing UI path; `diagnose.ts` builds the richer report.
  */
 export function explainConnectionFailure(input: {
   snapshot: PeerSnapshot | null;

@@ -5,9 +5,27 @@ import { ConfirmCode } from "@/components/ConfirmCode";
 import { QrCode } from "@/components/QrCode";
 import { StatusScreen } from "@/components/StatusScreen";
 import { TvButton } from "@/components/TvButton";
-import { createRoom, deleteRoom, getAnswer } from "@/lib/client/api";
+import {
+  createRoom,
+  deleteRoom,
+  getAnswer,
+  getCandidates,
+  postCandidates,
+} from "@/lib/client/api";
 import { createLogger } from "@/lib/log/logger";
-import { explainConnectionFailure, snapshotPeer, trackPeerConnection } from "@/lib/log/webrtc";
+import { capturePeerDiagnostics } from "@/lib/log/diagnose";
+import type { DiagnosticError, DiagnosticPhase } from "@/lib/log/diagnose";
+import { ROOM_TTL_SECONDS } from "@/lib/rooms/config";
+import { getIceServers, summarizeIceServers } from "@/lib/rtc/ice-config";
+import { createIceTrickle } from "@/lib/rtc/trickle";
+import type { IceTrickle } from "@/lib/rtc/trickle";
+import {
+  emptyCandidateCounts,
+  explainConnectionFailure,
+  trackDataChannel,
+  trackPeerConnection,
+} from "@/lib/log/webrtc";
+import type { PeerTracker } from "@/lib/log/webrtc";
 import { analyzeSdp } from "@/lib/rtc/candidates";
 import type { CandidateReport } from "@/lib/rtc/candidates";
 import { getDeviceName } from "@/lib/rtc/device";
@@ -24,7 +42,7 @@ import { confirmationCode } from "@/lib/rtc/sdp";
 import type { ControlMessage } from "@/lib/transfer/protocol";
 
 const POLL_INTERVAL_MS = 1_000;
-const ROOM_TTL_MS = 120_000;
+const ROOM_TTL_MS = ROOM_TTL_SECONDS * 1_000;
 
 type TvState =
   | { phase: "creating" }
@@ -43,13 +61,24 @@ export function TvReceiver() {
     let cancelled = false;
     let pc: RTCPeerConnection | null = null;
     let channels: PeerChannels | null = null;
-    let stopPeerTracking: (() => void) | null = null;
+    let tracker: PeerTracker | null = null;
+    let trickle: IceTrickle | null = null;
+    let stopChannelTracking: Array<() => void> = [];
     let pollTimer: ReturnType<typeof setTimeout> | null = null;
     let roomCode: string | null = null;
     let roomToken: string | null = null;
     let finished = false;
     let offerReport: CandidateReport | null = null;
     let answerReport: CandidateReport | null = null;
+    let phase: DiagnosticPhase = "answer-wait";
+    let firstError: DiagnosticError | null = null;
+    let signalingLost = false;
+    let configuredTurn = 0;
+    let startedAt = Date.now();
+
+    const recordError = (event: string, detail: string) => {
+      if (!firstError) firstError = { event, detail };
+    };
 
     const stopPolling = () => {
       if (pollTimer) {
@@ -58,43 +87,96 @@ export function TvReceiver() {
       }
     };
 
-    const releaseRoom = () => {
+    const releaseRoom = (remove = false) => {
       if (!roomCode || !roomToken) return;
       const code = roomCode;
       const token = roomToken;
       roomCode = null;
       roomToken = null;
-      // void deleteRoom(code, token).catch(() => undefined);
+      log.info("room:release", {
+        code,
+        phase,
+        localCandidates: tracker?.counts().total ?? 0,
+        deleted: remove,
+      });
+
+      if (remove) {
+        void deleteRoom(code, token)
+          .then(() => log.info("room:deleted", { code }))
+          .catch((error: unknown) => {
+            log.warn("room:delete-failed", {
+              code,
+              error: error instanceof Error ? error.name : "unknown",
+            });
+          });
+      }
     };
 
-    const fail = (message: string, title = "Something went wrong") => {
+    const fail = (message: string, title = "Something went wrong", event = "fail") => {
       if (cancelled || finished) return;
       finished = true;
-      log.error("state:error", { title, message });
+      recordError(event, `${title}: ${message}`);
+      log.error("state:error", { title, message, phase });
 
       stopPolling();
-      releaseRoom();
+      trickle?.stop();
 
       const doomed = pc;
       const doomedChannels = channels ? [channels.control, channels.data] : [];
+      const local = tracker?.counts() ?? emptyCandidateCounts();
+      const ice = trickle?.counts() ?? null;
+      const elapsedMs = Date.now() - startedAt;
+
+      // Stop using the connection immediately, but keep it alive until the
+      // diagnostic snapshot has been read. A closed peer reports nothing.
       pc = null;
 
       setState({ phase: "error", title, message });
 
-      // Capture the stats before closing, otherwise the snapshot is useless.
       if (doomed) {
-        void snapshotPeer(doomed, doomedChannels)
-          .then((snapshot) => log.error("peer:snapshot", { peer: snapshot }))
-          .catch(() => undefined)
-          .finally(() => doomed.close());
+        void capturePeerDiagnostics({
+          role: "tv",
+          phase,
+          pc: doomed,
+          channels: doomedChannels,
+          local,
+          trickle: ice,
+          configuredTurn,
+          signalingLost: signalingLost || ice?.signalingLost === true,
+          firstError,
+          elapsedMs,
+        })
+          .then(({ snapshot, report }) => {
+            log.error("peer:snapshot", { peer: snapshot });
+            log.error("diagnostics:report", report);
+            if (report.case !== "OK") {
+              log.warn("diagnostics:case", { case: report.case, title: report.title });
+            }
+          })
+          .catch((error: unknown) => {
+            log.warn("diagnostics:failed", {
+              error: error instanceof Error ? error.name : "unknown",
+            });
+          })
+          .finally(() => {
+            doomed.close();
+            releaseRoom();
+          });
+      } else {
+        releaseRoom();
       }
     };
 
     const succeed = (deviceName: string) => {
       if (cancelled || finished) return;
+      finished = true;
+      phase = "connected";
       log.mark("state:connected", { deviceName });
       stopPolling();
-      releaseRoom();
+      trickle?.stop();
+      // CONFIRM is the point where the room is no longer needed. Deleting it
+      // earlier would cut off candidate exchange for the other side.
+      releaseRoom(true);
       setState({ phase: "connected", deviceName });
     };
 
@@ -118,16 +200,69 @@ export function TvReceiver() {
     const start = async () => {
       setState({ phase: "creating" });
       phoneNameRef.current = "Phone";
+      phase = "answer-wait";
+      firstError = null;
+      signalingLost = false;
+      startedAt = Date.now();
+      offerReport = null;
+      answerReport = null;
       log.mark("attempt:start", { attempt: attempt + 1 });
+      const iceServers = summarizeIceServers(getIceServers());
+      configuredTurn = iceServers.turn;
+      log.info("session:env", {
+        userAgent: navigator.userAgent,
+        platform: navigator.platform,
+        language: navigator.language,
+        secureContext: window.isSecureContext,
+        hasPeerConnection: typeof RTCPeerConnection === "function",
+        origin: window.location.origin,
+        iceServers,
+      });
 
       try {
         const connection = createPeerConnection();
         pc = connection;
-        stopPeerTracking = trackPeerConnection(connection, log.child("rtc"));
+        tracker = trackPeerConnection(connection, log.child("rtc"));
 
         const peerChannels = createChannels(connection);
         channels = peerChannels;
+        stopChannelTracking = [
+          trackDataChannel(peerChannels.control, log.child("rtc")),
+          trackDataChannel(peerChannels.data, log.child("rtc")),
+        ];
         log.info("channels:created", { labels: [peerChannels.control.label, peerChannels.data.label] });
+
+        // Capture before the offer exists so early host candidates are buffered
+        // until the room (and therefore the mailbox) has been created.
+        trickle = createIceTrickle({
+          pc: connection,
+          log: log.child("ice"),
+          transport: {
+            post: (candidates, complete) => {
+              if (!roomCode || !roomToken) {
+                return Promise.reject(new Error("Room is not ready."));
+              }
+              return postCandidates(roomCode, { token: roomToken }, candidates, complete);
+            },
+            get: (since) => {
+              if (!roomCode || !roomToken) {
+                return Promise.reject(new Error("Room is not ready."));
+              }
+              return getCandidates(roomCode, { token: roomToken }, since);
+            },
+          },
+        });
+        trickle.capture();
+
+        connection.addEventListener("iceconnectionstatechange", () => {
+          log.info("ice:state", { state: connection.iceConnectionState, phase });
+          if (
+            connection.iceConnectionState === "checking" &&
+            (phase === "answer-wait" || phase === "remote-description")
+          ) {
+            phase = "checking";
+          }
+        });
 
         connection.addEventListener("connectionstatechange", () => {
           if (cancelled) return;
@@ -138,7 +273,7 @@ export function TvReceiver() {
             local: offerReport,
             remote: answerReport,
           });
-          fail(explanation.message, explanation.title);
+          fail(explanation.message, explanation.title, "connectionstatechange:failed");
         });
 
         // Attach before the channel opens so the first HELLO is never missed.
@@ -153,11 +288,6 @@ export function TvReceiver() {
 
         offerReport = analyzeSdp(offer.sdp ?? "");
         log.info("offer:created", { candidates: offerReport });
-        if (offerReport.verdict === "none") {
-          const explanation = explainConnectionFailure({ snapshot: null, local: offerReport, remote: null });
-          fail(explanation.message, explanation.title);
-          return;
-        }
 
         const room = await createRoom(offer);
         roomCode = room.code;
@@ -168,6 +298,12 @@ export function TvReceiver() {
           releaseRoom();
           return;
         }
+
+        // Candidates captured before this point were buffered; this flushes
+        // them and starts the remote mailbox poll. Candidates that arrive
+        // before setRemoteDescription are queued by the controller.
+        trickle.start();
+        trickle.pollRemote();
 
         setState({
           phase: "waiting",
@@ -183,7 +319,8 @@ export function TvReceiver() {
         const poll = async () => {
           if (cancelled || !pc) return;
           if (Date.now() >= deadline) {
-            fail("This code expired. Show a new code.");
+            signalingLost = true;
+            fail("This code expired. Show a new code.", "Code expired", "room:expired");
             return;
           }
 
@@ -200,26 +337,20 @@ export function TvReceiver() {
 
             log.info("poll:answer-received", { polls: pollCount, elapsedMs: Date.now() - startedAt });
 
+            phase = "remote-description";
             await connection.setRemoteDescription(answer);
             answerReport = analyzeSdp(answer.sdp ?? "");
             log.info("pc:remote-description-set", { candidates: answerReport });
 
-            if (answerReport.verdict === "none") {
-              const explanation = explainConnectionFailure({
-                snapshot: null,
-                local: offerReport,
-                remote: answerReport,
-              });
-              fail(explanation.message, explanation.title);
-              return;
-            }
+            // Queued candidates can only be applied once the answer is set.
+            await trickle?.applyRemote();
+            log.info("trickle:counts", { counts: trickle?.counts() ?? null });
 
             const confirmation = await confirmationCode(offer.sdp ?? "", answer.sdp ?? "");
             if (cancelled) return;
             log.info("confirm:code", { confirmation });
 
-            // The room has done its job once the answer is in.
-            releaseRoom();
+            phase = "channel-wait";
             setState({ phase: "confirming", confirmation });
             log.mark("state:confirming");
 
@@ -238,14 +369,14 @@ export function TvReceiver() {
             log.info("control:hello-sent", { name: getDeviceName() });
           } catch (error) {
             const explanation = failureFromError(error, offerReport, answerReport);
-            fail(explanation.message, explanation.title);
+            fail(explanation.message, explanation.title, "poll:error");
           }
         };
 
         void poll();
       } catch (error) {
         const explanation = failureFromError(error, offerReport, answerReport);
-        fail(explanation.message, explanation.title);
+        fail(explanation.message, explanation.title, "start:error");
       }
     };
 
@@ -253,10 +384,21 @@ export function TvReceiver() {
 
     return () => {
       cancelled = true;
-      log.info("attempt:cleanup");
+      phase = "closed";
+      log.info("attempt:cleanup", {
+        localCandidates: tracker?.counts().total ?? 0,
+        channels: channels
+          ? [channels.control.readyState, channels.data.readyState]
+          : [],
+      });
       stopPolling();
       releaseRoom();
-      stopPeerTracking?.();
+      trickle?.stop();
+      trickle = null;
+      tracker?.stop();
+      tracker = null;
+      for (const stop of stopChannelTracking) stop();
+      stopChannelTracking = [];
       pc?.close();
       pc = null;
     };
